@@ -1,22 +1,37 @@
 package main
 
 import (
-	"./websocket" 
 	"fmt"
 	"net/http"
-	"sync"
 	"os"
+	"sync"
+
+	"./websocket"
 )
 
-type ChatRoom struct {
-	clients map[string]Client
-	clientsMtx sync.Mutex
-	queue   chan string
+var chat chatroom
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
-func (cr *ChatRoom) Init() {
-	cr.queue = make(chan string, 5)
-	cr.clients = make(map[string]Client)
+type client struct {
+	name    string
+	conn    *websocket.Conn
+	belongs *chatroom
+}
+
+type chatroom struct {
+	clients    map[string]client
+	clientsMtx sync.Mutex // Инициализация мьютекса
+	queue      chan string //Инициализация канала
+}
+
+func (cr *chatroom) init() {
+	cr.queue = make(chan string) 
+	cr.clients = make(map[string]client)
 
 	go func() {
 		for {
@@ -25,85 +40,71 @@ func (cr *ChatRoom) Init() {
 	}()
 }
 
-func (cr *ChatRoom) Join(name string, conn *websocket.Conn) *Client {
-	defer cr.clientsMtx.Unlock();
-
-	cr.clientsMtx.Lock();
+func (cr *chatroom) join(name string, conn *websocket.Conn) *client {
+	// Оператор defer откладывает выполнение функции до того момента, как произойдет возврат из окружающей функции.
+	defer cr.clientsMtx.Unlock()
+    // предотвращение одновременного доступа к карте клиентов
+	cr.clientsMtx.Lock()
 	if _, exists := cr.clients[name]; exists {
 		return nil
 	}
-	client := Client{
-		name:      name,
-		conn:      conn,
-		belongsTo: cr,
+	client := client{
+		name:    name,
+		conn:    conn,
+		belongs: cr,
 	}
 	cr.clients[name] = client
-	 
+
 	cr.AddMsg("<B>" + name + "</B> присоеденился.")
 	return &client
 }
 
-func (cr *ChatRoom) Leave(name string) {
-	cr.clientsMtx.Lock(); 
+func (cr *chatroom) leave(name string) {
+	cr.clientsMtx.Lock()
 	delete(cr.clients, name)
-	cr.clientsMtx.Unlock(); 
+	cr.clientsMtx.Unlock()
 	cr.AddMsg("<B>" + name + "</B> вышел из чата.")
 }
-
-func (cr *ChatRoom) AddMsg(msg string) {
+// Отправление сообщений в канал
+func (cr *chatroom) AddMsg(msg string) {
 	cr.queue <- msg
 }
-
-func (cr *ChatRoom) BroadCast() {
+// Трансляция сообщений
+func (cr *chatroom) BroadCast() {
 	msgBlock := ""
-infLoop:
+inf:
 	for {
 		select {
 		case m := <-cr.queue:
 			msgBlock += m + "<BR>"
 		default:
-			break infLoop
+			break inf
 		}
 	}
 	if len(msgBlock) > 0 {
 		for _, client := range cr.clients {
-			client.Send(msgBlock)
+			client.send(msgBlock)
 		}
 	}
 }
 
-
-type Client struct {
-	name      string
-	conn      *websocket.Conn
-	belongsTo *ChatRoom
+func (cl *client) newmsg(msg string) {
+	cl.belongs.AddMsg("<B>" + cl.name + ":</B> " + msg)
 }
 
-func (cl *Client) NewMsg(msg string) {
-	cl.belongsTo.AddMsg("<B>" + cl.name + ":</B> " + msg)
+func (cl *client) exit() {
+	cl.belongs.leave(cl.name)
 }
 
-func (cl *Client) Exit() {
-	cl.belongsTo.Leave(cl.name)
-}
-
-func (cl *Client) Send(msgs string) {
+func (cl *client) send(msgs string) {
 	cl.conn.WriteMessage(websocket.TextMessage, []byte(msgs))
 }
 
-var chat ChatRoom
-
-func staticFiles(w http.ResponseWriter, r *http.Request) {
+func fileServer(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "./net"+r.URL.Path)
 }
-	
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
 
-func wsHandler(w http.ResponseWriter, r *http.Request) {
+func handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 
@@ -113,19 +114,19 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	go func() {
 		_, msg, err := conn.ReadMessage()
-		client := chat.Join(string(msg), conn)
+		client := chat.join(string(msg), conn)
 		if client == nil || err != nil {
-			conn.Close() 
+			conn.Close()
 			return
 		}
 
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
-				client.Exit()
+				client.exit()
 				return
 			}
-			client.NewMsg(string(msg))
+			client.newmsg(string(msg))
 		}
 
 	}()
@@ -144,8 +145,8 @@ func printHostname() {
 
 func main() {
 	printHostname()
-	http.HandleFunc("/ws", wsHandler)
-	http.HandleFunc("/", staticFiles)
-	chat.Init()
+	http.HandleFunc("/ws", handleMessages)
+	http.HandleFunc("/", fileServer)
+	chat.init()
 	http.ListenAndServe(":8000", nil)
 }
